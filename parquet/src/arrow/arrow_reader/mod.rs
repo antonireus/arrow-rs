@@ -259,6 +259,8 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) metrics: ArrowReaderMetrics,
 
     pub(crate) max_predicate_cache_size: usize,
+
+    pub(crate) invalid_utf8: InvalidUtf8,
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -276,6 +278,7 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
             .field("limit", &self.limit)
             .field("offset", &self.offset)
             .field("metrics", &self.metrics)
+            .field("invalid_utf8", &self.invalid_utf8)
             .finish()
     }
 }
@@ -299,6 +302,7 @@ impl<T> ArrowReaderBuilder<T> {
             offset: None,
             metrics: ArrowReaderMetrics::Disabled,
             max_predicate_cache_size: 100 * 1024 * 1024, // 100MB default cache size
+            invalid_utf8: metadata.invalid_utf8,
         }
     }
 
@@ -605,6 +609,22 @@ pub struct ArrowReaderOptions {
     pub(crate) file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 
     virtual_columns: Vec<FieldRef>,
+
+    invalid_utf8: InvalidUtf8,
+}
+
+/// What the reader does when a string column holds bytes that are not valid UTF-8
+///
+/// Set with [`ArrowReaderOptions::with_invalid_utf8`]. It applies to columns read
+/// as `Utf8`, `LargeUtf8`, `Utf8View`, or a dictionary of these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InvalidUtf8 {
+    /// Fail the read with an error
+    #[default]
+    Error,
+    /// Replace each invalid sequence with U+FFFD, as [`String::from_utf8_lossy`] does,
+    /// value by value
+    Replace,
 }
 
 impl ArrowReaderOptions {
@@ -953,6 +973,19 @@ impl ArrowReaderOptions {
         })
     }
 
+    /// Set how string columns holding invalid UTF-8 are read (defaults to
+    /// [`InvalidUtf8::Error`])
+    ///
+    /// Statistics, page indexes, and bloom filters still describe the original
+    /// bytes, so pruning with them can skip a value that only matches after
+    /// replacement.
+    pub fn with_invalid_utf8(self, invalid_utf8: InvalidUtf8) -> Self {
+        Self {
+            invalid_utf8,
+            ..self
+        }
+    }
+
     /// Retrieve the currently set [`PageIndexPolicy`] for the offset index.
     ///
     /// This can be set via [`with_offset_index_policy`][Self::with_offset_index_policy]
@@ -1072,6 +1105,8 @@ pub struct ArrowReaderMetadata {
     pub(crate) schema: SchemaRef,
     /// The Parquet schema (root field)
     pub(crate) fields: Option<Arc<ParquetField>>,
+    /// How string columns holding invalid UTF-8 are read
+    pub(crate) invalid_utf8: InvalidUtf8,
 }
 
 impl ArrowReaderMetadata {
@@ -1111,7 +1146,8 @@ impl ArrowReaderMetadata {
     /// This function will not attempt to load the PageIndex if not present in the metadata, regardless
     /// of the settings in `options`. See [`Self::load`] to load metadata including the page index if needed.
     pub fn try_new(metadata: Arc<ParquetMetaData>, options: ArrowReaderOptions) -> Result<Self> {
-        match options.supplied_schema {
+        let invalid_utf8 = options.invalid_utf8;
+        let metadata = match options.supplied_schema {
             Some(supplied_schema) => Self::with_supplied_schema(
                 metadata,
                 supplied_schema.clone(),
@@ -1134,9 +1170,14 @@ impl ArrowReaderMetadata {
                     metadata,
                     schema: Arc::new(schema),
                     fields: fields.map(Arc::new),
+                    invalid_utf8: InvalidUtf8::default(),
                 })
             }
-        }
+        }?;
+        Ok(Self {
+            invalid_utf8,
+            ..metadata
+        })
     }
 
     fn with_supplied_schema(
@@ -1217,6 +1258,7 @@ impl ArrowReaderMetadata {
             metadata,
             schema,
             fields: field_levels.levels.map(Arc::new),
+            invalid_utf8: InvalidUtf8::default(),
         })
     }
 
@@ -1424,6 +1466,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             metrics,
             // Not used for the sync reader, see https://github.com/apache/arrow-rs/issues/8000
             max_predicate_cache_size: _,
+            invalid_utf8,
         } = self;
 
         // Try to avoid allocate large buffer
@@ -1456,6 +1499,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_batch_size(batch_size)
+                    .with_invalid_utf8(invalid_utf8)
                     .with_parquet_metadata(&reader.metadata)
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
@@ -1465,6 +1509,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
         let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
             .with_batch_size(batch_size)
+            .with_invalid_utf8(invalid_utf8)
             .with_parquet_metadata(&reader.metadata)
             .build_array_reader(fields.as_deref(), &projection)?;
 

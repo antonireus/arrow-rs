@@ -325,6 +325,7 @@ impl ParquetPushDecoderBuilder {
             metrics,
             row_selection_policy,
             max_predicate_cache_size,
+            invalid_utf8,
         } = self;
 
         // Evaluate eligible same-projection predicates as one predicate.
@@ -349,7 +350,8 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
-        );
+        )
+        .with_invalid_utf8(invalid_utf8);
 
         // Initialize the decoder with the configured options
         let mut remaining_row_groups = RemainingRowGroups::new(
@@ -394,6 +396,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         max_predicate_cache_size,
         metrics,
         row_selection_policy,
+        invalid_utf8,
         buffers,
     } = reader_builder;
 
@@ -411,6 +414,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         offset,
         metrics,
         max_predicate_cache_size,
+        invalid_utf8,
     }
     // Carry the decoder's already-fetched bytes across the rebuild so the new
     // decoder does not re-request them.

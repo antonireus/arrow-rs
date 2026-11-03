@@ -30,6 +30,7 @@ use bytes::Bytes;
 use crate::arrow::array_reader::byte_array::{ByteArrayDecoder, ByteArrayDecoderPlain};
 use crate::arrow::array_reader::fixed_len_byte_array::ValueDecoder as FixedByteArrayDecoder;
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::arrow_reader::InvalidUtf8;
 use crate::arrow::buffer::{dictionary_buffer::DictionaryBuffer, offset_buffer::OffsetBuffer};
 use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
@@ -44,7 +45,7 @@ use crate::util::bit_util::BitPacking;
 /// A macro to reduce verbosity of [`make_byte_array_dictionary_reader`]
 macro_rules! make_reader {
     (
-        ($pages:expr, $column_desc:expr, $data_type:expr, $batch_size:expr, $padding_threshold:expr) => match ($k:expr, $v:expr) {
+        ($pages:expr, $column_desc:expr, $data_type:expr, $batch_size:expr, $padding_threshold:expr, $replace_invalid_utf8:expr) => match ($k:expr, $v:expr) {
             $(($key_arrow:pat, $value_arrow:pat) => ($key_type:ty, $value_type:ty),)+
         }
     ) => {
@@ -52,6 +53,7 @@ macro_rules! make_reader {
             $(
                 ($key_arrow, $value_arrow) => {
                     let mut reader = GenericRecordReader::new($column_desc, $batch_size);
+                    reader.set_replace_invalid_utf8($replace_invalid_utf8);
                     if let Some(threshold) = $padding_threshold {
                         reader.set_padding_threshold(threshold);
                     }
@@ -85,6 +87,7 @@ pub fn make_byte_array_dictionary_reader(
     arrow_type: Option<ArrowType>,
     batch_size: usize,
     padding_threshold: Option<i16>,
+    invalid_utf8: InvalidUtf8,
 ) -> Result<Box<dyn ArrayReader>> {
     // Check if Arrow type is specified, else create it from Parquet type
     let data_type = match arrow_type {
@@ -96,8 +99,13 @@ pub fn make_byte_array_dictionary_reader(
 
     match &data_type {
         ArrowType::Dictionary(key_type, value_type) => {
+            let replace_invalid_utf8 = invalid_utf8 == InvalidUtf8::Replace
+                && matches!(
+                    value_type.as_ref(),
+                    ArrowType::Utf8 | ArrowType::LargeUtf8 | ArrowType::Utf8View
+                );
             make_reader! {
-                (pages, column_desc, data_type, batch_size, padding_threshold) => match (key_type.as_ref(), value_type.as_ref()) {
+                (pages, column_desc, data_type, batch_size, padding_threshold, replace_invalid_utf8) => match (key_type.as_ref(), value_type.as_ref()) {
                     (ArrowType::UInt8, ArrowType::Binary | ArrowType::Utf8 | ArrowType::Utf8View | ArrowType::BinaryView | ArrowType::FixedSizeBinary(_)) => (u8, i32),
                     (ArrowType::UInt8, ArrowType::LargeBinary | ArrowType::LargeUtf8) => (u8, i64),
                     (ArrowType::Int8, ArrowType::Binary | ArrowType::Utf8 | ArrowType::Utf8View | ArrowType::BinaryView | ArrowType::FixedSizeBinary(_)) => (i8, i32),
@@ -295,7 +303,7 @@ struct DictionaryDecoder<K, V> {
     /// Dictionary decoder
     decoder: Option<MaybeDictionaryDecoder>,
 
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 
     value_type: ArrowType,
 
@@ -314,7 +322,8 @@ where
     type Buffer = DictionaryBuffer<K, V>;
 
     fn new(col: &ColumnDescPtr) -> Self {
-        let validate_utf8 = col.converted_type() == ConvertedType::UTF8;
+        let validate_utf8 =
+            (col.converted_type() == ConvertedType::UTF8).then_some(InvalidUtf8::Error);
 
         let value_type = match (V::IS_LARGE, col.converted_type() == ConvertedType::UTF8) {
             (true, true) => ArrowType::LargeUtf8,
@@ -331,6 +340,12 @@ where
             flba_column_descr: (col.physical_type() == Type::FIXED_LEN_BYTE_ARRAY)
                 .then(|| col.clone()),
             phantom: Default::default(),
+        }
+    }
+
+    fn set_replace_invalid_utf8(&mut self, replace: bool) {
+        if replace {
+            self.validate_utf8 = self.validate_utf8.and(Some(InvalidUtf8::Replace));
         }
     }
 

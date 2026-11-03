@@ -144,7 +144,7 @@ pub(crate) fn decode_dictionary_page(
             "Dictionary page encoding must be PLAIN, got {encoding:?}"
         )));
     }
-    let mut decoder = ByteArrayDecoderPlain::new(buf, num_values, Some(num_values), false);
+    let mut decoder = ByteArrayDecoderPlain::new(buf, num_values, Some(num_values), None);
     let mut offsets = OffsetBuffer::<i32>::with_capacity(num_values);
     decoder.read(&mut offsets, usize::MAX)?;
     if offsets.len() != num_values {

@@ -127,6 +127,38 @@ impl<I: OffsetSizeTrait> OffsetBuffer<I> {
         check_valid_utf8(&self.values.as_slice()[start_offset..])
     }
 
+    /// Returns true if the values from index `first` on start on UTF-8 character boundaries
+    pub fn on_char_boundaries(&self, first: usize) -> bool {
+        self.offsets[first..].iter().all(|offset| {
+            let first_byte = self.values.get(offset.as_usize());
+            first_byte.is_none_or(|&b| (b as i8) >= -0x40)
+        })
+    }
+
+    /// Replaces invalid UTF-8 in the values from index `first` on with U+FFFD
+    ///
+    /// `split_char` tells a value starts mid-character, which checking the values as one
+    /// run of bytes misses
+    pub fn replace_invalid_utf8(&mut self, first: usize, split_char: bool) -> Result<()> {
+        let start_offset = self.offsets[first].as_usize();
+        if !split_char && self.check_valid_utf8(start_offset).is_ok() {
+            return Ok(());
+        }
+        let values = self.values.split_off(start_offset);
+        let ends = self.offsets.split_off(first + 1);
+        let mut value_start = 0;
+        for end in ends {
+            let value_end = end.as_usize() - start_offset;
+            let value = String::from_utf8_lossy(&values[value_start..value_end]);
+            self.values.extend_from_slice(value.as_bytes());
+            let offset = I::from_usize(self.values.len())
+                .ok_or_else(|| general_err!("index overflow decoding byte array"))?;
+            self.offsets.push(offset);
+            value_start = value_end;
+        }
+        Ok(())
+    }
+
     /// Converts this into an [`ArrayRef`] with the provided `data_type` and `null_buffer`
     pub fn into_array(self, null_buffer: Option<Buffer>, data_type: ArrowType) -> ArrayRef {
         let array_data_builder = ArrayDataBuilder::new(data_type)

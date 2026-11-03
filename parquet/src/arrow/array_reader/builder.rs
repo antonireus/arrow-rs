@@ -33,8 +33,8 @@ use crate::arrow::array_reader::{
     NullArrayReader, PrimitiveArrayReader, RowGroups, StructArrayReader,
     make_byte_array_dictionary_reader, make_byte_array_reader,
 };
-use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::arrow_reader::{DEFAULT_BATCH_SIZE, InvalidUtf8};
 use crate::arrow::schema::{ParquetField, ParquetFieldType, VirtualColumnType};
 use crate::basic::Type as PhysicalType;
 use crate::data_type::{BoolType, DoubleType, FloatType, Int32Type, Int64Type, Int96Type};
@@ -99,6 +99,8 @@ pub struct ArrayReaderBuilder<'a> {
     metrics: &'a ArrowReaderMetrics,
     /// Batch size hint for pre-allocating internal buffers (see [`Self::with_batch_size`])
     batch_size: usize,
+    /// How string columns holding invalid UTF-8 are read (see [`Self::with_invalid_utf8`])
+    invalid_utf8: InvalidUtf8,
 }
 
 /// Arguments threaded through the recursive `build_*_reader` calls.
@@ -148,7 +150,14 @@ impl<'a> ArrayReaderBuilder<'a> {
             parquet_metadata: None,
             metrics,
             batch_size: DEFAULT_BATCH_SIZE,
+            invalid_utf8: InvalidUtf8::default(),
         }
+    }
+
+    /// Set how string columns holding invalid UTF-8 are read
+    pub fn with_invalid_utf8(mut self, invalid_utf8: InvalidUtf8) -> Self {
+        self.invalid_utf8 = invalid_utf8;
+        self
     }
 
     /// Set the batch size hint used to pre-allocate internal buffers.
@@ -543,6 +552,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                     arrow_type,
                     self.batch_size,
                     padding_threshold,
+                    self.invalid_utf8,
                 )?,
                 Some(DataType::Utf8View | DataType::BinaryView) => make_byte_view_array_reader(
                     page_iterator,
@@ -550,6 +560,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                     arrow_type,
                     self.batch_size,
                     padding_threshold,
+                    self.invalid_utf8,
                 )?,
                 _ => make_byte_array_reader(
                     page_iterator,
@@ -557,6 +568,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                     arrow_type,
                     self.batch_size,
                     padding_threshold,
+                    self.invalid_utf8,
                 )?,
             },
             PhysicalType::FIXED_LEN_BYTE_ARRAY => match arrow_type {
@@ -566,6 +578,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                     arrow_type,
                     self.batch_size,
                     padding_threshold,
+                    self.invalid_utf8,
                 )?,
                 _ => make_fixed_len_byte_array_reader(
                     page_iterator,
