@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::arrow_reader::InvalidUtf8;
 use crate::arrow::buffer::view_buffer::ViewBuffer;
 use crate::arrow::decoder::{DeltaByteArrayDecoder, DictIndexDecoder};
 use crate::arrow::record_reader::GenericRecordReader;
@@ -47,6 +48,7 @@ pub fn make_byte_view_array_reader(
     arrow_type: Option<ArrowType>,
     batch_size: usize,
     padding_threshold: Option<i16>,
+    invalid_utf8: InvalidUtf8,
 ) -> Result<Box<dyn ArrayReader>> {
     // Check if Arrow type is specified, else create it from Parquet type
     let data_type = match arrow_type {
@@ -57,9 +59,13 @@ pub fn make_byte_view_array_reader(
         },
     };
 
+    let replace_invalid_utf8 =
+        invalid_utf8 == InvalidUtf8::Replace && data_type == ArrowType::Utf8View;
+
     match data_type {
         ArrowType::BinaryView | ArrowType::Utf8View => {
             let mut reader = GenericRecordReader::new(column_desc, batch_size);
+            reader.set_replace_invalid_utf8(replace_invalid_utf8);
             if let Some(threshold) = padding_threshold {
                 reader.set_padding_threshold(threshold);
             }
@@ -70,6 +76,14 @@ pub fn make_byte_view_array_reader(
             "invalid data type for byte array reader read to view type - {}",
             data_type
         )),
+    }
+}
+
+/// Checks `bytes` is valid UTF-8, returning `true` if it is not and must be replaced
+fn check_utf8(bytes: &[u8], validate_utf8: Option<InvalidUtf8>) -> Result<bool> {
+    match check_valid_utf8(bytes) {
+        Err(_) if validate_utf8 == Some(InvalidUtf8::Replace) => Ok(true),
+        result => result.map(|()| false),
     }
 }
 
@@ -144,18 +158,25 @@ impl ArrayReader for ByteViewArrayReader {
 struct ByteViewArrayColumnValueDecoder {
     dict: Option<ViewBuffer>,
     decoder: Option<ByteViewArrayDecoder>,
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 }
 
 impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
     type Buffer = ViewBuffer;
 
     fn new(desc: &ColumnDescPtr) -> Self {
-        let validate_utf8 = desc.converted_type() == ConvertedType::UTF8;
+        let validate_utf8 =
+            (desc.converted_type() == ConvertedType::UTF8).then_some(InvalidUtf8::Error);
         Self {
             dict: None,
             decoder: None,
             validate_utf8,
+        }
+    }
+
+    fn set_replace_invalid_utf8(&mut self, replace: bool) {
+        if replace {
+            self.validate_utf8 = self.validate_utf8.and(Some(InvalidUtf8::Replace));
         }
     }
 
@@ -235,7 +256,7 @@ impl ByteViewArrayDecoder {
         data: Bytes,
         num_levels: usize,
         num_values: Option<usize>,
-        validate_utf8: bool,
+        validate_utf8: Option<InvalidUtf8>,
     ) -> Result<Self> {
         let decoder = match encoding {
             Encoding::PLAIN => ByteViewArrayDecoder::Plain(ByteViewArrayDecoderPlain::new(
@@ -305,7 +326,7 @@ pub struct ByteViewArrayDecoderPlain {
     buf: Buffer,
     offset: usize,
 
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 
     /// This is a maximum as the null count is not always known, e.g. value data from
     /// a v1 data page
@@ -317,7 +338,7 @@ impl ByteViewArrayDecoderPlain {
         buf: Bytes,
         num_levels: usize,
         num_values: Option<usize>,
-        validate_utf8: bool,
+        validate_utf8: Option<InvalidUtf8>,
     ) -> Self {
         Self {
             buf: Buffer::from(buf),
@@ -328,7 +349,7 @@ impl ByteViewArrayDecoderPlain {
     }
 
     pub fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
-        if self.validate_utf8 {
+        if self.validate_utf8.is_some() {
             self.read_impl::<true>(output, len)
         } else {
             self.read_impl::<false>(output, len)
@@ -340,6 +361,8 @@ impl ByteViewArrayDecoderPlain {
         output: &mut ViewBuffer,
         len: usize,
     ) -> Result<usize> {
+        let initial_len = output.views.len();
+        let mut needs_replace = false;
         // avoid creating a new buffer if the last buffer is the same as the current buffer
         // This is especially useful when row-level filtering is applied, where we call lots of small `read` over the same buffer.
         let block_id = {
@@ -407,9 +430,10 @@ impl ByteViewArrayDecoderPlain {
                 // If the length is larger than 128, then we validate the buffer before the length bytes, and move the water mark to the beginning of next string.
                 if len >= 128 {
                     // unfortunately, the len bytes may not be valid utf8, we need to wrap up and validate everything before it.
-                    check_valid_utf8(unsafe {
-                        buf.get_unchecked(utf8_validation_begin..start_offset - 4)
-                    })?;
+                    needs_replace |= check_utf8(
+                        unsafe { buf.get_unchecked(utf8_validation_begin..start_offset - 4) },
+                        self.validate_utf8,
+                    )?;
                     // move the cursor to skip the len bytes.
                     utf8_validation_begin = start_offset;
                 }
@@ -433,12 +457,18 @@ impl ByteViewArrayDecoderPlain {
         if VALIDATE_UTF8 {
             // validate values from the previously validated location up to (but not including)
             // the length of this string
-            check_valid_utf8(unsafe { buf.get_unchecked(utf8_validation_begin..end_offset) })?;
+            needs_replace |= check_utf8(
+                unsafe { buf.get_unchecked(utf8_validation_begin..end_offset) },
+                self.validate_utf8,
+            )?;
         }
 
         self.offset = end_offset;
         self.max_remaining_values -= to_read;
 
+        if needs_replace {
+            output.replace_invalid_utf8(initial_len)?;
+        }
         Ok(to_read)
     }
 
@@ -573,11 +603,11 @@ pub struct ByteViewArrayDecoderDeltaLength {
     data: Bytes,
     length_offset: usize,
     data_offset: usize,
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 }
 
 impl ByteViewArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: Option<InvalidUtf8>) -> Result<Self> {
         let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
         len_decoder.set_data(data.clone(), 0)?;
         let values = len_decoder.values_left();
@@ -612,6 +642,7 @@ impl ByteViewArrayDecoderDeltaLength {
     }
 
     fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
+        let initial_len = output.views.len();
         let to_read = len.min(self.lengths.len() - self.length_offset);
         output.views.reserve(to_read);
 
@@ -638,8 +669,17 @@ impl ByteViewArrayDecoderDeltaLength {
         }));
 
         // Delta length encoding has continuous strings, we can validate utf8 in one go
-        if self.validate_utf8 {
-            check_valid_utf8(&self.data[initial_offset..current_offset])?;
+        let needs_replace = self.validate_utf8.is_some()
+            && check_utf8(
+                &self.data[initial_offset..current_offset],
+                self.validate_utf8,
+            )?;
+        // A value boundary can split a character, which the checks above miss
+        if needs_replace
+            || self.validate_utf8 == Some(InvalidUtf8::Replace)
+                && !output.on_char_boundaries(initial_len)
+        {
+            output.replace_invalid_utf8(initial_len)?;
         }
 
         self.data_offset = current_offset;
@@ -664,11 +704,11 @@ impl ByteViewArrayDecoderDeltaLength {
 /// Decoder from [`Encoding::DELTA_BYTE_ARRAY`] to [`ViewBuffer`]
 pub struct ByteViewArrayDecoderDelta {
     decoder: DeltaByteArrayDecoder,
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 }
 
 impl ByteViewArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: Option<InvalidUtf8>) -> Result<Self> {
         Ok(Self {
             decoder: DeltaByteArrayDecoder::new(data)?,
             validate_utf8,
@@ -698,7 +738,8 @@ impl ByteViewArrayDecoderDelta {
         let initial_len = output.views.len();
         let mut write_count = 0;
 
-        let read = if !self.validate_utf8 {
+        let mut needs_replace = false;
+        let read = if self.validate_utf8.is_none() {
             self.decoder.read(len, |bytes| {
                 let offset = array_buffer.len();
                 let view = make_view(bytes, buffer_id, offset as u32);
@@ -739,8 +780,8 @@ impl ByteViewArrayDecoderDelta {
                 write_count += 1;
                 Ok(())
             })?;
-            check_valid_utf8(&array_buffer)?;
-            check_valid_utf8(&utf8_validation_buffer)?;
+            needs_replace = check_utf8(&array_buffer, self.validate_utf8)?
+                | check_utf8(&utf8_validation_buffer, self.validate_utf8)?;
             v
         };
 
@@ -751,6 +792,13 @@ impl ByteViewArrayDecoderDelta {
 
         let actual_block_id = output.append_block(Buffer::from_vec(array_buffer));
         assert_eq!(actual_block_id, buffer_id);
+        // A value boundary can split a character, which the checks above miss
+        if needs_replace
+            || self.validate_utf8 == Some(InvalidUtf8::Replace)
+                && !output.on_char_boundaries(initial_len)
+        {
+            output.replace_invalid_utf8(initial_len)?;
+        }
         Ok(read)
     }
 

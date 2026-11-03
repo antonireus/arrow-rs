@@ -85,6 +85,8 @@ pub struct GenericRecordReader<V, CV> {
     /// as the valid_mask for `pad_nulls` (via `as_slice()`) and as the null
     /// bitmap consumed by the leaf reader (via `consume_compact_bitmap`).
     compact_bitmap: Option<BooleanBufferBuilder>,
+    /// Replace invalid UTF-8 with U+FFFD instead of failing
+    replace_invalid_utf8: bool,
 }
 
 impl<V, CV> GenericRecordReader<V, CV>
@@ -114,13 +116,20 @@ where
             values_written: 0,
             padding_threshold: None,
             compact_bitmap: None,
+            replace_invalid_utf8: false,
         }
+    }
+
+    /// Replace invalid UTF-8 with U+FFFD instead of failing
+    pub fn set_replace_invalid_utf8(&mut self, replace: bool) {
+        self.replace_invalid_utf8 = replace;
     }
 
     /// Set the current page reader.
     pub fn set_page_reader(&mut self, page_reader: Box<dyn PageReader>) -> Result<()> {
         let descr = &self.column_desc;
-        let values_decoder = CV::new(descr);
+        let mut values_decoder = CV::new(descr);
+        values_decoder.set_replace_invalid_utf8(self.replace_invalid_utf8);
 
         let def_level_decoder = (descr.max_def_level() != 0).then(|| {
             DefinitionLevelBufferDecoder::new(descr.max_def_level(), packed_null_mask(descr))

@@ -87,6 +87,9 @@ pub trait ColumnValueDecoder {
     /// Create a new [`ColumnValueDecoder`]
     fn new(col: &ColumnDescPtr) -> Self;
 
+    /// Replace invalid UTF-8 with U+FFFD instead of failing
+    fn set_replace_invalid_utf8(&mut self, _replace: bool) {}
+
     /// Set the current dictionary page
     fn set_dict(
         &mut self,

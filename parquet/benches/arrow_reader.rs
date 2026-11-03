@@ -31,7 +31,7 @@ use parquet::arrow::array_reader::{
     make_fixed_len_byte_array_reader,
 };
 use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, DEFAULT_BATCH_SIZE, ParquetRecordBatchReaderBuilder,
+    ArrowReaderOptions, DEFAULT_BATCH_SIZE, InvalidUtf8, ParquetRecordBatchReaderBuilder,
 };
 use parquet::basic::{Compression, Type};
 use parquet::data_type::{ByteArray, FixedLenByteArrayType};
@@ -1083,6 +1083,7 @@ fn create_decimal_by_bytes_reader(
             arrow_type,
             DEFAULT_BATCH_SIZE,
             None,
+            InvalidUtf8::Error,
         )
         .unwrap(),
         Type::FIXED_LEN_BYTE_ARRAY => make_fixed_len_byte_array_reader(
@@ -1121,6 +1122,7 @@ fn create_byte_array_reader(
         None,
         DEFAULT_BATCH_SIZE,
         None,
+        InvalidUtf8::Error,
     )
     .unwrap()
 }
@@ -1135,6 +1137,7 @@ fn create_byte_view_array_reader(
         None,
         DEFAULT_BATCH_SIZE,
         None,
+        InvalidUtf8::Error,
     )
     .unwrap()
 }
@@ -1149,6 +1152,7 @@ fn create_string_view_byte_array_reader(
         None,
         DEFAULT_BATCH_SIZE,
         None,
+        InvalidUtf8::Error,
     )
     .unwrap()
 }
@@ -1166,6 +1170,7 @@ fn create_string_byte_array_dictionary_reader(
         Some(arrow_type),
         DEFAULT_BATCH_SIZE,
         None,
+        InvalidUtf8::Error,
     )
     .unwrap()
 }
@@ -1180,6 +1185,7 @@ fn create_string_list_reader(
         None,
         DEFAULT_BATCH_SIZE,
         Some(2),
+        InvalidUtf8::Error,
     )
     .unwrap();
     let field = Field::new_list_field(DataType::Utf8, true);

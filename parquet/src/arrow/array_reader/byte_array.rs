@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::arrow_reader::InvalidUtf8;
 use crate::arrow::buffer::bit_util::sign_extend_be;
 use crate::arrow::buffer::offset_buffer::OffsetBuffer;
 use crate::arrow::decoder::{DeltaByteArrayDecoder, DictIndexDecoder};
@@ -44,6 +45,7 @@ pub fn make_byte_array_reader(
     arrow_type: Option<ArrowType>,
     batch_size: usize,
     padding_threshold: Option<i16>,
+    invalid_utf8: InvalidUtf8,
 ) -> Result<Box<dyn ArrayReader>> {
     // Check if Arrow type is specified, else create it from Parquet type
     let data_type = match arrow_type {
@@ -53,12 +55,16 @@ pub fn make_byte_array_reader(
             .clone(),
     };
 
+    let replace_invalid_utf8 = invalid_utf8 == InvalidUtf8::Replace
+        && matches!(data_type, ArrowType::Utf8 | ArrowType::LargeUtf8);
+
     match data_type {
         ArrowType::Binary
         | ArrowType::Utf8
         | ArrowType::Decimal128(_, _)
         | ArrowType::Decimal256(_, _) => {
             let mut reader = GenericRecordReader::new(column_desc, batch_size);
+            reader.set_replace_invalid_utf8(replace_invalid_utf8);
             if let Some(threshold) = padding_threshold {
                 reader.set_padding_threshold(threshold);
             }
@@ -68,6 +74,7 @@ pub fn make_byte_array_reader(
         }
         ArrowType::LargeUtf8 | ArrowType::LargeBinary => {
             let mut reader = GenericRecordReader::new(column_desc, batch_size);
+            reader.set_replace_invalid_utf8(replace_invalid_utf8);
             if let Some(threshold) = padding_threshold {
                 reader.set_padding_threshold(threshold);
             }
@@ -178,22 +185,34 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
     }
 }
 
+/// Returns false if `value` starts with a UTF-8 continuation byte, splitting a character
+fn starts_on_char_boundary(value: &[u8]) -> bool {
+    value.first().is_none_or(|&b| (b as i8) >= -0x40)
+}
+
 /// A [`ColumnValueDecoder`] for variable length byte arrays
 struct ByteArrayColumnValueDecoder<I: OffsetSizeTrait> {
     dict: Option<OffsetBuffer<I>>,
     decoder: Option<ByteArrayDecoder>,
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 }
 
 impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
     type Buffer = OffsetBuffer<I>;
 
     fn new(desc: &ColumnDescPtr) -> Self {
-        let validate_utf8 = desc.converted_type() == ConvertedType::UTF8;
+        let validate_utf8 =
+            (desc.converted_type() == ConvertedType::UTF8).then_some(InvalidUtf8::Error);
         Self {
             dict: None,
             decoder: None,
             validate_utf8,
+        }
+    }
+
+    fn set_replace_invalid_utf8(&mut self, replace: bool) {
+        if replace {
+            self.validate_utf8 = self.validate_utf8.and(Some(InvalidUtf8::Replace));
         }
     }
 
@@ -276,7 +295,7 @@ impl ByteArrayDecoder {
         data: Bytes,
         num_levels: usize,
         num_values: Option<usize>,
-        validate_utf8: bool,
+        validate_utf8: Option<InvalidUtf8>,
     ) -> Result<Self> {
         let decoder = match encoding {
             Encoding::PLAIN => ByteArrayDecoder::Plain(ByteArrayDecoderPlain::new(
@@ -349,7 +368,7 @@ impl ByteArrayDecoder {
 pub struct ByteArrayDecoderPlain {
     buf: Bytes,
     offset: usize,
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 
     /// This is a maximum as the null count is not always known, e.g. value data from
     /// a v1 data page
@@ -361,7 +380,7 @@ impl ByteArrayDecoderPlain {
         buf: Bytes,
         num_levels: usize,
         num_values: Option<usize>,
-        validate_utf8: bool,
+        validate_utf8: Option<InvalidUtf8>,
     ) -> Self {
         Self {
             buf,
@@ -376,6 +395,20 @@ impl ByteArrayDecoderPlain {
         output: &mut OffsetBuffer<I>,
         len: usize,
     ) -> Result<usize> {
+        match self.validate_utf8 {
+            Some(InvalidUtf8::Replace) => self.read_impl::<I, true>(output, len, false),
+            validate_utf8 => self.read_impl::<I, false>(output, len, validate_utf8.is_some()),
+        }
+    }
+
+    /// `REPLACE` is const so that reads that do not replace keep a loop free of its checks
+    fn read_impl<I: OffsetSizeTrait, const REPLACE: bool>(
+        &mut self,
+        output: &mut OffsetBuffer<I>,
+        len: usize,
+        validate_utf8: bool,
+    ) -> Result<usize> {
+        let initial_len = output.len();
         let initial_values_length = output.values.len();
 
         let to_read = len.min(self.max_remaining_values);
@@ -395,6 +428,7 @@ impl ByteArrayDecoderPlain {
 
         let mut read = 0;
 
+        let mut split_char = false;
         let buf = self.buf.as_ref();
         while self.offset < self.buf.len() && read != to_read {
             if self.offset + 4 > buf.len() {
@@ -409,14 +443,18 @@ impl ByteArrayDecoderPlain {
                 return Err(ParquetError::EOF("eof decoding byte array".into()));
             }
 
-            output.try_push(&buf[start_offset..end_offset], self.validate_utf8)?;
+            let value = &buf[start_offset..end_offset];
+            split_char |= REPLACE && !starts_on_char_boundary(value);
+            output.try_push(value, validate_utf8)?;
 
             self.offset = end_offset;
             read += 1;
         }
         self.max_remaining_values -= read;
 
-        if self.validate_utf8 {
+        if REPLACE {
+            output.replace_invalid_utf8(initial_len, split_char)?;
+        } else if validate_utf8 {
             output.check_valid_utf8(initial_values_length)?;
         }
         Ok(read)
@@ -447,11 +485,11 @@ pub struct ByteArrayDecoderDeltaLength {
     data: Bytes,
     length_offset: usize,
     data_offset: usize,
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 }
 
 impl ByteArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: Option<InvalidUtf8>) -> Result<Self> {
         let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
         len_decoder.set_data(data.clone(), 0)?;
         let values = len_decoder.values_left();
@@ -492,6 +530,7 @@ impl ByteArrayDecoderDeltaLength {
         output: &mut OffsetBuffer<I>,
         len: usize,
     ) -> Result<usize> {
+        let initial_len = output.len();
         let initial_values_length = output.values.len();
 
         let to_read = len.min(self.lengths.len() - self.length_offset);
@@ -522,8 +561,13 @@ impl ByteArrayDecoderDeltaLength {
         self.data_offset = data_end;
         self.length_offset += to_read;
 
-        if self.validate_utf8 {
-            output.check_valid_utf8(initial_values_length)?;
+        match self.validate_utf8 {
+            Some(InvalidUtf8::Replace) => {
+                let split_char = !output.on_char_boundaries(initial_len);
+                output.replace_invalid_utf8(initial_len, split_char)?;
+            }
+            Some(InvalidUtf8::Error) => output.check_valid_utf8(initial_values_length)?,
+            None => {}
         }
         Ok(to_read)
     }
@@ -551,11 +595,11 @@ impl ByteArrayDecoderDeltaLength {
 /// Decoder from [`Encoding::DELTA_BYTE_ARRAY`] to [`OffsetBuffer`]
 pub struct ByteArrayDecoderDelta {
     decoder: DeltaByteArrayDecoder,
-    validate_utf8: bool,
+    validate_utf8: Option<InvalidUtf8>,
 }
 
 impl ByteArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: Option<InvalidUtf8>) -> Result<Self> {
         Ok(Self {
             decoder: DeltaByteArrayDecoder::new(data)?,
             validate_utf8,
@@ -567,14 +611,32 @@ impl ByteArrayDecoderDelta {
         output: &mut OffsetBuffer<I>,
         len: usize,
     ) -> Result<usize> {
+        match self.validate_utf8 {
+            Some(InvalidUtf8::Replace) => self.read_impl::<I, true>(output, len, false),
+            validate_utf8 => self.read_impl::<I, false>(output, len, validate_utf8.is_some()),
+        }
+    }
+
+    /// `REPLACE` is const so that reads that do not replace keep a loop free of its checks
+    fn read_impl<I: OffsetSizeTrait, const REPLACE: bool>(
+        &mut self,
+        output: &mut OffsetBuffer<I>,
+        len: usize,
+        validate_utf8: bool,
+    ) -> Result<usize> {
+        let initial_len = output.len();
         let initial_values_length = output.values.len();
         output.offsets.reserve(len.min(self.decoder.remaining()));
 
-        let read = self
-            .decoder
-            .read(len, |bytes| output.try_push(bytes, self.validate_utf8))?;
+        let mut split_char = false;
+        let read = self.decoder.read(len, |bytes| {
+            split_char |= REPLACE && !starts_on_char_boundary(bytes);
+            output.try_push(bytes, validate_utf8)
+        })?;
 
-        if self.validate_utf8 {
+        if REPLACE {
+            output.replace_invalid_utf8(initial_len, split_char)?;
+        } else if validate_utf8 {
             output.check_valid_utf8(initial_values_length)?;
         }
         Ok(read)
@@ -771,7 +833,7 @@ mod tests {
         // The page claims to contain two values, but its buffer contains only
         // one complete PLAIN-encoded BYTE_ARRAY value.
         let buffer = Bytes::from_static(&[3, 0, 0, 0, b'f', b'o', b'o']);
-        let mut decoder = ByteArrayDecoderPlain::new(buffer, 2, Some(2), false);
+        let mut decoder = ByteArrayDecoderPlain::new(buffer, 2, Some(2), None);
         let mut output = OffsetBuffer::<i32>::with_capacity(2);
 
         assert_eq!(decoder.read(&mut output, 2).unwrap(), 1);
@@ -813,7 +875,7 @@ mod tests {
             .into_iter()
             .find(|(encoding, _)| *encoding == Encoding::DELTA_LENGTH_BYTE_ARRAY)
             .unwrap();
-        let mut decoder = ByteArrayDecoderDeltaLength::new(page, true).unwrap();
+        let mut decoder = ByteArrayDecoderDeltaLength::new(page, Some(InvalidUtf8::Error)).unwrap();
         let mut output = OffsetBuffer::<i32>::with_capacity(0);
         output.try_push(b"prefix", true).unwrap();
 
@@ -839,7 +901,7 @@ mod tests {
             .into_iter()
             .find(|(encoding, _)| *encoding == Encoding::DELTA_LENGTH_BYTE_ARRAY)
             .unwrap();
-        let mut decoder = ByteArrayDecoderDeltaLength::new(page, false).unwrap();
+        let mut decoder = ByteArrayDecoderDeltaLength::new(page, None).unwrap();
         let data_offset = decoder.data_offset;
         let mut output = OffsetBuffer::<i32> {
             offsets: vec![0, i32::MAX],

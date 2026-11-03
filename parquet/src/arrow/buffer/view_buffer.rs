@@ -16,11 +16,17 @@
 // under the License.
 
 use crate::arrow::record_reader::buffer::ValuesBuffer;
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
+use arrow_array::builder::make_view;
 use arrow_array::{ArrayRef, BinaryViewArray, StringViewArray};
 use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
+use arrow_data::ByteView;
 use arrow_schema::DataType as ArrowType;
+use std::borrow::Cow;
 use std::sync::Arc;
+
+/// The high bit of each of the 12 bytes a view can hold inline
+const INLINE_HIGH_BITS: u128 = 0x8080_8080_8080_8080_8080_8080;
 
 /// A buffer of view type byte arrays that can be converted into
 /// `GenericByteViewArray`
@@ -53,6 +59,49 @@ impl ViewBuffer {
     }
 
     /// Converts this into an [`ArrayRef`] with the provided `data_type` and `null_buffer`
+    /// Returns true if the values from index `first` on start on UTF-8 character boundaries
+    pub fn on_char_boundaries(&self, first: usize) -> bool {
+        // The 4 bytes after the length hold the first bytes of any non-empty value
+        let first_byte = |view: u128| (view >> 32) as u8 as i8;
+        self.views[first..]
+            .iter()
+            .all(|&view| view as u32 == 0 || first_byte(view) >= -0x40)
+    }
+
+    /// Replaces invalid UTF-8 in the values from index `first` on with U+FFFD
+    pub fn replace_invalid_utf8(&mut self, first: usize) -> Result<()> {
+        let block_id = self.buffers.len() as u32;
+        let mut block = Vec::new();
+        for view in &mut self.views[first..] {
+            let len = *view as u32 as usize;
+            // A short value is stored in the view itself, so ASCII is a single mask test
+            if len <= 12 && (*view >> 32) & (INLINE_HIGH_BITS >> (96 - 8 * len)) == 0 {
+                continue;
+            }
+            let inline = view.to_le_bytes();
+            let value = match len {
+                0..=12 => &inline[4..4 + len],
+                _ => {
+                    let view = ByteView::from(*view);
+                    let offset = view.offset as usize;
+                    &self.buffers[view.buffer_index as usize][offset..offset + len]
+                }
+            };
+            if let Cow::Owned(value) = String::from_utf8_lossy(value) {
+                let offset = u32::try_from(block.len())
+                    .map_err(|_| general_err!("index overflow decoding byte array"))?;
+                if value.len() > 12 {
+                    block.extend_from_slice(value.as_bytes());
+                }
+                *view = make_view(value.as_bytes(), block_id, offset);
+            }
+        }
+        if !block.is_empty() {
+            self.append_block(Buffer::from_vec(block));
+        }
+        Ok(())
+    }
+
     pub fn into_array(self, null_buffer: Option<Buffer>, data_type: &ArrowType) -> ArrayRef {
         let len = self.views.len();
         let views = ScalarBuffer::from(self.views);

@@ -24,8 +24,8 @@ use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::{LoadedRowRanges, RowSelectionStrategy};
 use crate::arrow::arrow_reader::{
-    ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
-    RowSelectionPolicy,
+    InvalidUtf8, ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter,
+    RowSelection, RowSelectionPolicy,
 };
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
@@ -194,6 +194,9 @@ pub(crate) struct RowGroupReaderBuilder {
     /// Strategy for materialising row selections
     row_selection_policy: RowSelectionPolicy,
 
+    /// How string columns holding invalid UTF-8 are read
+    invalid_utf8: InvalidUtf8,
+
     /// Current state of the decoder.
     ///
     /// It is taken when processing, and must be put back before returning
@@ -222,6 +225,7 @@ pub(crate) struct RowGroupReaderBuilderParts {
     pub max_predicate_cache_size: usize,
     pub metrics: ArrowReaderMetrics,
     pub row_selection_policy: RowSelectionPolicy,
+    pub invalid_utf8: InvalidUtf8,
     /// Bytes already pushed into the decoder, carried across a rebuild so they
     /// are not re-requested.
     pub buffers: PushBuffers,
@@ -268,9 +272,18 @@ impl RowGroupReaderBuilder {
             metrics,
             max_predicate_cache_size,
             row_selection_policy,
+            invalid_utf8: InvalidUtf8::default(),
             state: Some(RowGroupDecoderState::Finished),
             buffers,
             stages: Arc::new(stages),
+        }
+    }
+
+    /// Set how string columns holding invalid UTF-8 are read
+    pub(crate) fn with_invalid_utf8(self, invalid_utf8: InvalidUtf8) -> Self {
+        Self {
+            invalid_utf8,
+            ..self
         }
     }
 
@@ -289,6 +302,7 @@ impl RowGroupReaderBuilder {
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
+            invalid_utf8,
             state: _,
             buffers,
             // Recomputed from `filter` when the builder is rebuilt.
@@ -302,6 +316,7 @@ impl RowGroupReaderBuilder {
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
+            invalid_utf8,
             buffers,
         }
     }
@@ -571,6 +586,7 @@ impl RowGroupReaderBuilder {
 
                 let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
                     .with_batch_size(self.batch_size)
+                    .with_invalid_utf8(self.invalid_utf8)
                     .with_cache_options(Some(&cache_options))
                     .with_parquet_metadata(&self.metadata)
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
@@ -749,6 +765,7 @@ impl RowGroupReaderBuilder {
                 // if we have any cached results, connect them up
                 let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
                     .with_batch_size(self.batch_size)
+                    .with_invalid_utf8(self.invalid_utf8)
                     .with_parquet_metadata(&self.metadata);
                 let array_reader = if let Some(cache_info) = cache_info.as_ref() {
                     let cache_options: CacheOptions = cache_info.builder().consumer();

@@ -19,15 +19,18 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::{
-    Array, ArrayRef, GenericBinaryArray, GenericStringArray, OffsetSizeTrait, RecordBatch,
-    StringViewArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, GenericBinaryArray, GenericStringArray,
+    OffsetSizeTrait, RecordBatch, StringArray, StringViewArray,
 };
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Bytes;
 use parquet::{
     arrow::{
-        ArrowWriter,
-        arrow_reader::{ArrowReaderBuilder, ParquetRecordBatchReader},
+        ArrowWriter, ProjectionMask,
+        arrow_reader::{
+            ArrowPredicateFn, ArrowReaderBuilder, ArrowReaderOptions, InvalidUtf8,
+            ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowFilter,
+        },
     },
     basic::Encoding,
     file::properties::WriterProperties,
@@ -262,4 +265,187 @@ fn read_from_parquet(data: Vec<u8>) -> Result<Vec<RecordBatch>, ArrowError> {
         .unwrap();
 
     reader.collect()
+}
+
+type Values = Vec<Option<Vec<u8>>>;
+
+/// The invalid cases above, plus characters split across two values, which are
+/// valid UTF-8 only once the values are concatenated
+fn replace_cases() -> Vec<Values> {
+    let mut cases: Vec<Values> = [
+        invalid_utf8_first_char::<i32>(),
+        invalid_utf8_first_char_long_strings::<i32>(),
+        invalid_utf8_later_char::<i32>(),
+        invalid_utf8_later_char_long_strings::<i32>(),
+        invalid_utf8_later_char_really_long_strings::<i32>(),
+        invalid_utf8_later_char_really_long_strings2::<i32>(),
+    ]
+    .iter()
+    .map(|array| array.iter().map(|v| v.map(<[u8]>::to_vec)).collect())
+    .collect();
+    let split: [&[u8]; 5] = [
+        b"price \xC2",
+        b"\xA3 ok",
+        b"ThisStringIsCertainlyLongerThan12Bytes\xE2\x82",
+        b"\xAC",
+        "\u{FC}ber, a value longer than 12 bytes".as_bytes(),
+    ];
+    cases.push(split.iter().map(|v| Some(v.to_vec())).collect());
+    cases
+}
+
+/// Writes `values` as a STRING column, optionally one value per data page, so a
+/// batch spans pages and later pages are decoded into a non-empty buffer
+fn write_strings(values: &Values, encoding: Option<Encoding>, one_value_per_page: bool) -> Bytes {
+    let binary = BinaryArray::from_iter(values.iter().map(|v| v.as_deref()));
+    let (offsets, data, nulls) = binary.into_parts();
+    // The values may not be valid UTF-8, as written by a writer that does not check
+    let strings = unsafe { StringArray::new_unchecked(offsets, data, nulls) };
+    let batch =
+        RecordBatch::try_from_iter_with_nullable([("c", Arc::new(strings) as ArrayRef, true)])
+            .unwrap();
+    let mut props = WriterProperties::builder();
+    if let Some(encoding) = encoding {
+        props = props.set_dictionary_enabled(false).set_encoding(encoding);
+    }
+    if one_value_per_page {
+        props = props
+            .set_data_page_row_count_limit(1)
+            .set_write_batch_size(1);
+    }
+    let mut data = vec![];
+    let mut writer = ArrowWriter::try_new(&mut data, batch.schema(), Some(props.build())).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    Bytes::from(data)
+}
+
+/// Options that replace invalid UTF-8 and read the column as `data_type`
+fn replace_options(data_type: &DataType) -> ArrowReaderOptions {
+    let schema = Schema::new(vec![Field::new("c", data_type.clone(), true)]);
+    ArrowReaderOptions::new()
+        .with_schema(Arc::new(schema))
+        .with_invalid_utf8(InvalidUtf8::Replace)
+}
+
+/// Checks each batch holds a valid array and returns its values as strings
+fn collect_strings(batches: &[RecordBatch]) -> Vec<Option<String>> {
+    let mut strings = vec![];
+    for batch in batches {
+        batch.column(0).to_data().validate_full().unwrap();
+        let column = arrow_cast::cast(batch.column(0), &DataType::Utf8).unwrap();
+        strings.extend(
+            column
+                .as_string::<i32>()
+                .iter()
+                .map(|v| v.map(str::to_owned)),
+        );
+    }
+    strings
+}
+
+/// `Utf8`, `LargeUtf8`, `Utf8View`, and a dictionary of `Utf8`
+fn string_types() -> [DataType; 4] {
+    let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        dictionary,
+    ]
+}
+
+#[test]
+fn test_invalid_utf8_replace() {
+    for values in replace_cases() {
+        let lossy = |v: &Option<Vec<u8>>| v.as_deref().map(|v| String::from_utf8_lossy(v).into());
+        let expected: Vec<Option<String>> = values.iter().map(lossy).collect();
+        for (encoding, one_value_per_page) in STRING_ENCODINGS
+            .iter()
+            .flat_map(|e| [(e, false), (e, true)])
+        {
+            let data = write_strings(&values, *encoding, one_value_per_page);
+            for (data_type, batch_size) in string_types().iter().flat_map(|t| [(t, 1), (t, 1024)]) {
+                let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+                    data.clone(),
+                    replace_options(data_type),
+                )
+                .unwrap()
+                .with_batch_size(batch_size)
+                .build()
+                .unwrap();
+                let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+                assert_eq!(batches[0].column(0).data_type(), data_type);
+                assert_eq!(
+                    collect_strings(&batches),
+                    expected,
+                    "{data_type} {encoding:?} {one_value_per_page} {batch_size}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_invalid_utf8_replace_row_filter() {
+    let values = replace_cases().pop().unwrap();
+    for encoding in STRING_ENCODINGS {
+        let data = write_strings(&values, *encoding, true);
+        for data_type in &string_types() {
+            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+                data.clone(),
+                replace_options(data_type),
+            )
+            .unwrap();
+            let mask = ProjectionMask::roots(builder.parquet_schema(), [0]);
+            // The predicate sees the replaced values
+            let predicate = ArrowPredicateFn::new(mask, |batch: RecordBatch| {
+                let column = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
+                let column = column.as_string::<i32>();
+                Ok(BooleanArray::from_iter(
+                    column.iter().map(|v| v.map(|v| v.contains('\u{FFFD}'))),
+                ))
+            });
+            let reader = builder
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                .build()
+                .unwrap();
+            let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+            let expected = [
+                "price \u{FFFD}",
+                "\u{FFFD} ok",
+                "ThisStringIsCertainlyLongerThan12Bytes\u{FFFD}",
+                "\u{FFFD}",
+            ];
+            let expected: Vec<_> = expected.map(|v| Some(v.to_string())).into();
+            assert_eq!(
+                collect_strings(&batches),
+                expected,
+                "{data_type} {encoding:?}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn test_invalid_utf8_replace_async() {
+    use futures::TryStreamExt;
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+
+    let data = write_strings(&vec![Some(b"price \xA3".to_vec())], None, false);
+    let options = replace_options(&DataType::Utf8);
+    let batches: Vec<_> =
+        ParquetRecordBatchStreamBuilder::new_with_options(std::io::Cursor::new(data), options)
+            .await
+            .unwrap()
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(
+        collect_strings(&batches),
+        [Some("price \u{FFFD}".to_string())]
+    );
 }

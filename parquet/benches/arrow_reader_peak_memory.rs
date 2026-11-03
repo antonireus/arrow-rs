@@ -32,7 +32,7 @@ use parquet::arrow::array_reader::make_byte_array_reader;
 use parquet::arrow::array_reader::{
     ArrayReader, ListArrayReader, PrimitiveArrayReader, make_fixed_len_byte_array_reader,
 };
-use parquet::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
+use parquet::arrow::arrow_reader::{DEFAULT_BATCH_SIZE, InvalidUtf8};
 use parquet::basic::Encoding;
 use parquet::column::page::PageIterator;
 use parquet::data_type::{ByteArrayType, DoubleType, FixedLenByteArrayType, Int32Type};
@@ -498,8 +498,15 @@ fn string_list_wrapper(
     pages: Box<dyn PageIterator>,
     column_desc: ColumnDescPtr,
 ) -> Box<dyn ArrayReader> {
-    let child =
-        make_byte_array_reader(pages, column_desc, None, DEFAULT_BATCH_SIZE, Some(2)).unwrap();
+    let child = make_byte_array_reader(
+        pages,
+        column_desc,
+        None,
+        DEFAULT_BATCH_SIZE,
+        Some(2),
+        InvalidUtf8::Error,
+    )
+    .unwrap();
     let field = Field::new_list_field(DataType::Utf8, true);
     let data_type = DataType::List(Arc::new(field));
     Box::new(ListArrayReader::<i32>::new(
